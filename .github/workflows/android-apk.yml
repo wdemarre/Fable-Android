@@ -1,0 +1,432 @@
+# Android ARM64 APK, built on GitHub-hosted runners (docs/android.md, "Build the APK").
+#
+# Three jobs:
+#   templates   the patched Godot 4.7.1 Android templates (tools/android/godot-patches)
+#   llvm        Clang and LLD cross-built for the phone at tools/android/NATIVE.md's pin
+#   apk         the desktop ReXGlue generator, the ARM64 runtime (build-native.py --rexnet),
+#               the phone compiler tools (build-phone-tools.py) and build-apk.py
+#
+# templates and llvm are slow (about one and two to four hours) and are cached: they are built
+# again only when the Godot patches or the LLVM pin change. A run whose llvm step hits the time
+# limit keeps its compiler cache, so running it again continues where it stopped.
+#
+# Signing: without the secrets below every run signs with a new debug key, and an APK only
+# updates an installed one signed with the same key. To keep one key, add these repository
+# secrets (Settings > Secrets and variables > Actions):
+#   ANDROID_KEYSTORE_B64     the keystore file, base64-encoded
+#   ANDROID_STORE_PASSWORD   its store password
+#   ANDROID_KEY_PASSWORD     its key password
+#   ANDROID_KEY_ALIAS        its key alias (optional, default androiddebugkey)
+name: Android APK
+
+on:
+  push:
+    branches: [android-ci]
+  workflow_dispatch:
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NDK_VERSION: 28.2.13676358          # r28c, the runtime and the phone tools
+  TEMPLATE_NDK_VERSION: 29.0.14206865 # r29, Godot 4.7.1's own Android build
+  GODOT_TAG: 4.7.1-stable
+  GODOT_EDITOR_ZIP: Godot_v4.7.1-stable_mono_linux_x86_64.zip
+  GODOT_EDITOR_SHA256: 6ca7ff0459f1b806900be683c1b0837c607a9c16834c530dc68c81b9fc3ae1f6
+  GODOT_TEMPLATES_TPZ: Godot_v4.7.1-stable_mono_export_templates.tpz
+  GODOT_TEMPLATES_SHA256: ef9a708be51ecd974cd7dccdcafd7a1870da3d3e1c24c072bdbb9818c7a7db63
+  REFII_NO_TESTS: '1'
+
+jobs:
+  templates:
+    name: Patched Godot templates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache key
+        id: key
+        run: echo "key=godot-templates-${GODOT_TAG}-${{ hashFiles('tools/android/godot-patches/*.diff', 'tools/android/godot-patches/build-templates.py') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore templates
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/templates
+          key: ${{ steps.key.outputs.key }}
+
+      - name: Free disk space
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo rm -rf /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - uses: actions/setup-python@v5
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          python-version: '3.12'
+
+      - name: Install NDK r29 and SCons
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${TEMPLATE_NDK_VERSION}" > /dev/null
+          python -m pip install scons
+          scons --version
+
+      - name: Godot source with Swappy
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$GODOT_TAG" https://github.com/godotengine/godot.git "$RUNNER_TEMP/godot-src"
+          cd "$RUNNER_TEMP/godot-src"
+          python3 misc/scripts/install_swappy_android.py
+
+      - name: Official 4.7.1 .NET Android templates
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o templates.tpz \
+            "https://github.com/godotengine/godot/releases/download/${GODOT_TAG}/${GODOT_TEMPLATES_TPZ}"
+          echo "${GODOT_TEMPLATES_SHA256}  templates.tpz" | sha256sum -c -
+          mkdir official
+          unzip -j -q templates.tpz templates/android_debug.apk templates/android_release.apk \
+            templates/android_source.zip templates/version.txt -d official
+          rm templates.tpz
+          cat official/version.txt
+
+      - name: Build patched templates
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          python3 -B tools/android/godot-patches/build-templates.py \
+            --godot-source "$RUNNER_TEMP/godot-src" \
+            --official-templates "$RUNNER_TEMP/official" \
+            --out "$RUNNER_TEMP/templates" --jobs "$(nproc)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: godot-templates
+          path: ${{ runner.temp }}/templates
+          retention-days: 3
+          if-no-files-found: error
+
+  llvm:
+    name: Phone Clang and LLD
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: LLVM pin
+        id: pin
+        run: |
+          pin=$(sed -n "s/^LLVM_PIN = '\([0-9a-f]*\)'.*/\1/p" tools/android/build-phone-tools.py)
+          test -n "$pin"
+          echo "pin=$pin" >> "$GITHUB_OUTPUT"
+          echo "key=phone-llvm-$pin-${NDK_VERSION}-${{ hashFiles('tools/android/phone-tools/lld_main.cpp') }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore phone Clang and LLD
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/phone-llvm
+          key: ${{ steps.pin.outputs.key }}
+
+      - name: Free disk space
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo rm -rf /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - name: Install NDK r28c, Ninja and ccache
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${NDK_VERSION}" > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build ccache
+
+      # The compiler cache outlives a run that hits the time limit (saved even on failure), so
+      # running the workflow again picks up where the last one stopped.
+      - name: Restore compiler cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: phone-llvm-ccache-${{ steps.pin.outputs.pin }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: phone-llvm-ccache-${{ steps.pin.outputs.pin }}-
+
+      - name: llvm-project at the pin
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git init -q "$RUNNER_TEMP/llvm-project"
+          cd "$RUNNER_TEMP/llvm-project"
+          git remote add origin https://github.com/llvm/llvm-project.git
+          git fetch -q --depth 1 origin "${{ steps.pin.outputs.pin }}"
+          git checkout -q FETCH_HEAD
+          git rev-parse HEAD
+
+      - name: Cross-build Clang and LLD
+        if: steps.cache.outputs.cache-hit != 'true'
+        timeout-minutes: 320
+        env:
+          CCACHE_DIR: ${{ runner.temp }}/ccache
+          CCACHE_MAXSIZE: 4G
+          CCACHE_COMPILERCHECK: content
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: |
+          python3 -B - <<'EOF'
+          import importlib.util, os
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location('phone_tools', 'tools/android/build-phone-tools.py')
+          tools = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(tools)
+          temp = Path(os.environ['RUNNER_TEMP'])
+          ndk = Path(os.environ['ANDROID_HOME']) / 'ndk' / os.environ['NDK_VERSION']
+          out = temp / 'phone-llvm'
+          for folder in (out / 'native', out / 'logs'):
+              folder.mkdir(parents=True, exist_ok=True)
+          tools.build_llvm(temp / 'llvm-project', ndk, tools.prebuilt(ndk), temp / 'llvm-work',
+                           out / 'native', out / 'logs', os.cpu_count() or 4)
+          EOF
+          ls -l "$RUNNER_TEMP/phone-llvm/native"
+          ccache -s
+
+      - name: Save compiler cache
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: phone-llvm-ccache-${{ steps.pin.outputs.pin }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phone-llvm-logs
+          path: ${{ runner.temp }}/phone-llvm/logs
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phone-llvm
+          path: ${{ runner.temp }}/phone-llvm/native
+          retention-days: 3
+          if-no-files-found: error
+
+  apk:
+    name: APK
+    needs: [templates, llvm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      CCACHE_MAXSIZE: 3G
+      CCACHE_COMPILERCHECK: content
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 20
+        with:
+          submodules: recursive
+
+      - name: Free disk space
+        # Keeps the image's Android SDK; removes the other NDKs and toolchains this build never uses.
+        run: |
+          echo "CCACHE_DIR=$RUNNER_TEMP/ccache" >> "$GITHUB_ENV"
+          sudo rm -rf /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          find "$ANDROID_HOME/ndk" -mindepth 1 -maxdepth 1 -not -name "$NDK_VERSION" -exec sudo rm -rf {} +
+          df -h /
+
+      - name: Install Clang 20 and build dependencies
+        run: |
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash llvm.sh 20
+          rm llvm.sh
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build pkg-config python3 ccache unzip \
+            libx11-dev libx11-xcb-dev libxcb1-dev libwayland-dev libvulkan-dev \
+            libxcursor1 libxinerama1 libxrandr2 libxi6 libxkbcommon0 libfontconfig1 libgl1
+          clang-20 --version
+
+      - name: Android SDK packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-36" "build-tools;36.1.0" "ndk;${NDK_VERSION}" > /dev/null
+          echo "NDK=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # The desktop targets net8.0 and Android net9.0; the 10 SDK compiles the tree's C#
+      # (LangVersion latest), as in the desktop workflows.
+      - uses: actions/setup-dotnet@v4
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: .NET android workload
+        continue-on-error: true
+        run: |
+          dotnet --list-sdks
+          dotnet workload install android
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache fetched tools
+        uses: actions/cache@v4
+        with:
+          path: tools/cache
+          key: tools-linux-x86_64-${{ hashFiles('cmake/refii_fetch_godot.cmake', 'cmake/refii_fetch_zig.cmake') }}
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-android-${{ hashFiles('rexglue-net/rexglue-sdk/src/rexnet/core/Cargo.lock') }}
+          restore-keys: cargo-android-
+
+      - name: Cache Gradle and NuGet
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/export-cache
+          key: android-export-cache-${{ hashFiles('Godot/refii-launcher.csproj', 'Godot/src/android/Android.targets') }}
+          restore-keys: android-export-cache-
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: android-apk-ccache-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: android-apk-ccache-
+
+      - name: Godot 4.7.1 .NET editor
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o godot.zip \
+            "https://github.com/godotengine/godot/releases/download/${GODOT_TAG}/${GODOT_EDITOR_ZIP}"
+          echo "${GODOT_EDITOR_SHA256}  godot.zip" | sha256sum -c -
+          unzip -q godot.zip -d godot
+          rm godot.zip
+          editor=$(find "$RUNNER_TEMP/godot" -maxdepth 2 -type f -name 'Godot_v*_mono_linux.x86_64' | head -1)
+          test -x "$editor"
+          test -d "$(dirname "$editor")/GodotSharp"
+          echo "GODOT_EDITOR=$editor" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: godot-templates
+          path: ${{ runner.temp }}/templates
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: phone-llvm
+          path: ${{ runner.temp }}/phone-llvm/native
+
+      # build-native.py needs the desktop generator built from this checkout's SDK.
+      - name: Desktop ReXGlue generator
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: |
+          cmake --preset linux-amd64-debug-netplay
+          cmake --build --preset linux-amd64-debug-netplay --target rexglue
+          generator=$(find out/build -type f -name 'rexglue*' -perm -u+x -size +1M | grep -E '/rexglued?$' | head -1)
+          test -n "$generator"
+          echo "HOST_CODEGEN=$PWD/$generator" >> "$GITHUB_ENV"
+          echo "generator: $generator"
+
+      - name: ARM64 runtime
+        env:
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
+        run: |
+          python3 -B tools/android/build-native.py --ndk "$NDK" --output "$RUNNER_TEMP/out/native" \
+            --host-codegen "$HOST_CODEGEN" --game-version Fable2TU1 --jobs "$(nproc)" --rexnet
+
+      - name: Phone compiler tools
+        run: |
+          python3 -B tools/android/build-phone-tools.py --ndk "$NDK" --native "$RUNNER_TEMP/out/native" \
+            --tools-from "$RUNNER_TEMP/phone-llvm" --out "$RUNNER_TEMP/out/phone-tools" --jobs "$(nproc)"
+
+      - name: Build config and signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          {
+            echo "godot = \"$GODOT_EDITOR\""
+            echo "templates = \"$RUNNER_TEMP/templates\""
+            echo "dotnet = \"$DOTNET_ROOT\""
+            echo "jdk = \"$JAVA_HOME\""
+            echo "sdk = \"$ANDROID_HOME\""
+            echo "ndk = \"$NDK\""
+            echo "host_codegen = \"$HOST_CODEGEN\""
+            echo "phone_tools_from = \"$RUNNER_TEMP/out/phone-tools\""
+            echo "package = \"org.refii.androidpresentationprobe\""
+            echo "cache_root = \"$RUNNER_TEMP/export-cache\""
+            echo "jobs = $(nproc)"
+          } > "$RUNNER_TEMP/build-apk.toml"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            echo "keystore = \"$RUNNER_TEMP/release.keystore\"" >> "$RUNNER_TEMP/build-apk.toml"
+            echo "alias = \"${KEY_ALIAS:-androiddebugkey}\"" >> "$RUNNER_TEMP/build-apk.toml"
+            echo "Signing with the repository's keystore."
+          else
+            echo "::warning::No ANDROID_KEYSTORE_B64 secret: this APK is signed with a new debug key and cannot update one from another run."
+          fi
+          cat "$RUNNER_TEMP/build-apk.toml"
+
+      - name: Build APK
+        env:
+          REFII_ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          REFII_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          python3 -B tools/android/build-apk.py --config "$RUNNER_TEMP/build-apk.toml" \
+            --output "$RUNNER_TEMP/out/apk-build" --native "$RUNNER_TEMP/out/native"
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ccache
+          key: android-apk-ccache-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: refii-android-apk
+          path: |
+            ${{ runner.temp }}/out/apk-build/refii-android.apk
+            ${{ runner.temp }}/out/apk-build/SHA256SUMS.txt
+            ${{ runner.temp }}/out/apk-build/build-apk.json
+          retention-days: 14
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: refii-android-native-symbols
+          path: ${{ runner.temp }}/out/apk-build/apk/native-symbols
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refii-android-logs
+          path: |
+            ${{ runner.temp }}/out/**/*.log
+            ${{ runner.temp }}/out/**/*.json
+          retention-days: 7
